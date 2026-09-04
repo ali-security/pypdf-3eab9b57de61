@@ -1,16 +1,20 @@
 """Test the pypdf.generic module."""
 
 import codecs
+import os
+import subprocess
+import sys
 from base64 import a85encode
 from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
+from typing import Callable, Dict, Tuple
 
 import pytest
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.constants import CheckboxRadioButtonAttributes
-from pypdf.errors import PdfReadError, PdfStreamError
+from pypdf.errors import LimitReachedError, PdfReadError, PdfStreamError
 from pypdf.generic import (
     ArrayObject,
     BooleanObject,
@@ -46,6 +50,11 @@ from pypdf.generic._image_inline import (
 )
 
 from . import ReaderDummy, get_data_from_url
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 TESTS_ROOT = Path(__file__).parent.resolve()
 PROJECT_ROOT = TESTS_ROOT.parent
@@ -1271,3 +1280,167 @@ def test_contentstream_arrayobject_containing_nullobject(caplog):
     content_stream = ContentStream(stream=input_stream, pdf=None)
     assert content_stream.get_data() == b"Hello World!\n"
     assert caplog.text == ""
+
+
+def _build_pdf_with_declared_stream_length(length: int) -> bytes:
+    """Build a minimal one-page PDF whose content stream declares the given /Length."""
+    objects = [
+        b"<< /Type /Catalog /Pages 2 0 R >>",
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Contents 4 0 R "
+        b"/Resources << /Font << /F1 5 0 R >> >> >>",
+        b"<< /Length " + str(length).encode() + b" >>\nstream\n"
+        b"BT /F1 12 Tf 10 100 Td (Hello from pypdf) Tj ET\nendstream",
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ]
+    output = bytearray(b"%PDF-1.7\n")
+    offsets = []
+    for number, body in enumerate(objects, start=1):
+        offsets.append(len(output))
+        output += b"%d 0 obj\n" % number + body + b"\nendobj\n"
+    start_xref = len(output)
+    output += b"xref\n0 %d\n" % (len(objects) + 1)
+    output += b"0000000000 65535 f \n"
+    for offset in offsets:
+        output += b"%010d 00000 n \n" % offset
+    output += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (
+        len(objects) + 1,
+        start_xref,
+    )
+    return bytes(output)
+
+
+def test_dictionary_object__read_from_stream__declared_length_limit():
+    """A declared stream length beyond the limit must not be allocated."""
+    stream = BytesIO(b"<< /Length 2147483647 >>\nstream\nHello from pypdf\nendstream")
+    with pytest.raises(
+            expected_exception=LimitReachedError,
+            match=r"^Declared stream length of 2147483647 exceeds maximum allowed length\.$"
+    ):
+        DictionaryObject.read_from_stream(stream, None)
+
+    # A sane declared length keeps working.
+    stream = BytesIO(b"<< /Length 16 >>\nstream\nHello from pypdf\nendstream")
+    stream_object = DictionaryObject.read_from_stream(stream, None)
+    assert stream_object.get_data() == b"Hello from pypdf"
+
+
+def test_dictionary_object__read_from_stream__limit__offline():
+    """Reading a document with an oversized declared /Length raises instead of allocating it."""
+    reader = PdfReader(BytesIO(_build_pdf_with_declared_stream_length(2147483647)))
+    page = reader.pages[0]
+
+    with pytest.raises(
+            expected_exception=LimitReachedError,
+            match=r"^Declared stream length of 2147483647 exceeds maximum allowed length\.$"
+    ):
+        page.extract_text()
+
+    # The very same document with a correct length is read without any error.
+    content = b"BT /F1 12 Tf 10 100 Td (Hello from pypdf) Tj ET"
+    reader = PdfReader(BytesIO(_build_pdf_with_declared_stream_length(len(content))))
+    assert "Hello from pypdf" in reader.pages[0].extract_text()
+
+
+@pytest.mark.enable_socket
+def test_dictionary_object__read_from_stream__limit():
+    name = "read_from_stream__length_2gb.pdf"
+    url = "https://github.com/user-attachments/files/25842437/read_from_stream__length_2gb.pdf"
+
+    reader = PdfReader(BytesIO(get_data_from_url(url=url, name=name)))
+    page = reader.pages[0]
+
+    with pytest.raises(
+            expected_exception=LimitReachedError,
+            match=r"^Declared stream length of 2147483647 exceeds maximum allowed length\.$"
+    ):
+        page.extract_text()
+
+
+def _prepare_test_dictionary_object__read_from_stream__no_limit(
+        path: Path
+) -> Tuple[str, Dict[str, str], Callable[[], None]]:
+    env = os.environ.copy()
+    env["COVERAGE_PROCESS_START"] = "pyproject.toml"
+
+    name = "read_from_stream__length_2gb.pdf"
+    url = "https://github.com/user-attachments/files/25842437/read_from_stream__length_2gb.pdf"
+    data = get_data_from_url(url=url, name=name)
+    pdf_path = path / name
+    pdf_path.write_bytes(data)
+    pdf_path_str = pdf_path.resolve().as_posix()
+
+    try:
+        env["PYTHONPATH"] = "." + os.pathsep + env["PYTHONPATH"]
+    except KeyError:
+        env["PYTHONPATH"] = "."
+
+    def limit_virtual_memory() -> None:
+        limit_kb = 1_000_000
+        limit_bytes = limit_kb * 1024
+        resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+
+    return pdf_path_str, env, limit_virtual_memory
+
+
+@pytest.mark.enable_socket
+@pytest.mark.skipif(condition=resource is None, reason="Does not have 'resource' module.")
+@pytest.mark.skipif(sys.platform == "darwin", reason="RLIMIT_AS is unreliable.")
+def test_dictionary_object__read_from_stream__no_limit(tmp_path):
+    pdf_path_str, env, limit_virtual_memory = _prepare_test_dictionary_object__read_from_stream__no_limit(tmp_path)
+
+    source_file = tmp_path / "script.py"
+    source_file.write_text(
+        f"""
+import sys
+from pypdf import filters, PdfReader
+
+filters.MAX_DECLARED_STREAM_LENGTH = sys.maxsize
+
+with open({pdf_path_str!r}, mode="rb") as fd:
+    reader = PdfReader(fd)
+    print(reader.pages[0].extract_text())
+"""
+    )
+
+    result = subprocess.run(  # noqa: S603  # We have the control here.
+        [sys.executable, source_file],
+        capture_output=True,
+        env=env,
+        text=True,
+        preexec_fn=limit_virtual_memory,
+    )
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr.replace("\r", "").endswith("\nMemoryError\n")
+
+
+@pytest.mark.enable_socket
+@pytest.mark.skipif(condition=resource is None, reason="Does not have 'resource' module.")
+@pytest.mark.skipif(sys.platform == "darwin", reason="RLIMIT_AS is unreliable.")
+def test_dictionary_object__read_from_stream__no_limit__path(tmp_path):
+    pdf_path_str, env, limit_virtual_memory = _prepare_test_dictionary_object__read_from_stream__no_limit(tmp_path)
+
+    source_file = tmp_path / "script.py"
+    source_file.write_text(
+        f"""
+import sys
+from pypdf import filters, PdfReader
+
+filters.MAX_DECLARED_STREAM_LENGTH = sys.maxsize
+
+reader = PdfReader({pdf_path_str!r})
+print(reader.pages[0].extract_text())
+"""
+    )
+
+    result = subprocess.run(  # noqa: S603  # We have the control here.
+        [sys.executable, source_file],
+        capture_output=True,
+        env=env,
+        text=True,
+        preexec_fn=limit_virtual_memory,
+    )
+    assert result.returncode == 0
+    assert result.stdout.replace("\r", "") == "Hello from pypdf\n"
+    assert result.stderr == ""
