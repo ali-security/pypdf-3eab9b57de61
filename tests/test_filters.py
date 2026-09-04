@@ -879,9 +879,44 @@ def test_decompress():
     with mock.patch("pypdf.filters._decompress_with_limit", side_effect=zlib.error), \
             mock.patch("pypdf.filters.ZLIB_MAX_OUTPUT_LENGTH", len(compressed) - 13), \
             pytest.raises(
-                LimitReachedError, match=r"^Limit reached while decompressing\. 12 bytes remaining\."
+                LimitReachedError, match=r"^Limit reached while decompressing\. 12 bytes remaining\.$"
             ):
         decompress(compressed)
+
+    # Decompress byte-wise with input limit.
+    with mock.patch("pypdf.filters.ZLIB_MAX_RECOVERY_INPUT_LENGTH", 1000), \
+            pytest.raises(
+                LimitReachedError, match=r"^Recovery limit reached while decompressing\. 336 bytes remaining\.$"
+            ):
+        decompress(b"A" * 1337)
+
+
+def test_decompress__recovery_input_limit():
+    """
+    The byte-wise recovery must not scale with the input length (CVE-2026-27026).
+
+    Neither the number of decompression attempts nor the number of accesses on the
+    input data may depend on the size of the (broken) input stream.
+    """
+    class CountingBytes(bytes):
+        accesses = 0
+
+        def __getitem__(self, item):
+            CountingBytes.accesses += 1
+            return bytes.__getitem__(self, item)
+
+    data = CountingBytes(b"A" * 1_000_000)
+
+    with mock.patch("pypdf.filters.ZLIB_MAX_RECOVERY_INPUT_LENGTH", 1000), \
+            pytest.raises(
+                LimitReachedError,
+                match=r"^Recovery limit reached while decompressing\. 998999 bytes remaining\.$"
+            ):
+        decompress(data)
+
+    # Without the limit, every single one of the 1,000,000 bytes would be turned into
+    # its own bytes object and fed to the decompressor.
+    assert CountingBytes.accesses < 10_000
 
 
 def _create_zlib_bomb(megabytes: int = 200) -> bytes:
