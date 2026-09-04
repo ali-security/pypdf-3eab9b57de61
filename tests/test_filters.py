@@ -975,3 +975,32 @@ def test_lzw_decode__decompression_bomb():
         stream._data = compressed
         with pytest.raises(LimitReachedError, match=error_pattern):
             stream.get_data()
+
+
+def test_runlengthdecode__decode_limit():
+    """Decoding a RunLengthDecode stream must not exhaust the memory (CVE-2026-28351)."""
+    error_pattern = r"^Limit reached while decompressing\.$"
+
+    uncompressed_size = 76 * 1024 * 1024  # 76 MB target
+    runs = uncompressed_size // 128
+    encoded = (b"\x81A" * runs) + b"\x80"
+    assert len(encoded) < 1_500_000
+
+    with pytest.raises(expected_exception=LimitReachedError, match=error_pattern):
+        RunLengthDecode.decode(encoded)
+
+    # The limit applies to the stream object path as well.
+    with mock.patch("pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH", 1_000):
+        stream = EncodedStreamObject()
+        stream[NameObject("/Filter")] = NameObject("/RunLengthDecode")
+        stream._data = (b"\x81A" * 16) + b"\x80"  # 2048 bytes of output.
+        with pytest.raises(expected_exception=LimitReachedError, match=error_pattern):
+            stream.get_data()
+
+    uncompressed_size = 5 * 1024
+    runs = uncompressed_size // 128
+    encoded = (b"\x81A" * runs) + b"\x80"
+
+    # Use a very low limit for this exact comparison, otherwise *pytest* takes ages to render a failure diff.
+    with mock.patch("pypdf.filters.RUN_LENGTH_MAX_OUTPUT_LENGTH", uncompressed_size):
+        assert RunLengthDecode.decode(encoded) == b"A" * uncompressed_size
