@@ -14,6 +14,7 @@ import pytest
 from PIL import Image, ImageOps
 
 from pypdf import PdfReader
+from pypdf._codecs._codecs import LzwCodec
 from pypdf.errors import DependencyError, DeprecationError, LimitReachedError, PdfReadError, PdfStreamError
 from pypdf.filters import (
     ASCII85Decode,
@@ -23,6 +24,7 @@ from pypdf.filters import (
     CCITTParameters,
     FlateDecode,
     JBIG2Decode,
+    LZWDecode,
     RunLengthDecode,
     decompress,
 )
@@ -917,3 +919,24 @@ def test_flate_decode__decompression_bomb():
         LimitReachedError, match=r"^Limit reached while decompressing\. \d+ bytes remaining\.$"
     ):
         stream.get_data()
+
+
+def test_lzw_decode__decompression_bomb():
+    """Decoding an LZW stream must not exhaust the memory (CVE-2025-66019)."""
+    data = b"\x00" * 200_000
+    compressed = LzwCodec().encode(data)
+    assert len(compressed) < 2_000
+
+    # Without a lowered limit, the stream decodes as usual.
+    assert LZWDecode._decodeb(compressed) == data
+
+    error_pattern = r"^Limit reached while decompressing: \d+ > 1000$"
+    with mock.patch("pypdf.filters.LZW_MAX_OUTPUT_LENGTH", 1_000):
+        with pytest.raises(LimitReachedError, match=error_pattern):
+            LZWDecode._decodeb(compressed)
+
+        stream = EncodedStreamObject()
+        stream[NameObject("/Filter")] = NameObject("/LZWDecode")
+        stream._data = compressed
+        with pytest.raises(LimitReachedError, match=error_pattern):
+            stream.get_data()
