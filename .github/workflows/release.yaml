@@ -5,9 +5,7 @@
 # and that it's announced with a GitHub release.
 name: Create git tag
 on:
-  push:
-    branches:
-      - main
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -19,6 +17,7 @@ jobs:
   build_and_publish:
     name: Publish a new version
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     if: "${{ startsWith(github.event.head_commit.message, 'REL: ') }}"
     steps:
       - name: Checkout Repository

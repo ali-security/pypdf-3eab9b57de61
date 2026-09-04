@@ -1,9 +1,6 @@
 name: Create a GitHub release page
 
 on:
-  push:
-    tags:
-      - '*.*.*'
   workflow_dispatch:
 
 permissions:
@@ -13,6 +10,7 @@ jobs:
   build_and_publish:
     name: Create a GitHub release page
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
